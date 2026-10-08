@@ -1,0 +1,32 @@
+# HOST-SIDE TEST HARNESS ONLY.  The Android build is Android.mk (ndk-build).
+#
+#   make -f Makefile.hosttests check-reloc   # relocator units, vs llvm-mc
+#   make -f Makefile.hosttests run           # full engine under qemu-aarch64
+#
+# Needs: gcc-aarch64-linux-gnu, qemu-user-static, llvm (for llvm-mc).
+CROSS   ?= aarch64-linux-gnu-
+CC      := $(CROSS)gcc
+CFLAGS  ?= -O2 -Wall -Wextra -fPIC -DSH_TEST_HOOKS
+SRC     := src/hook.c src/mem.c src/patch.c src/put.c src/arm64_relocate.c src/bridge_arm64.S
+
+all: libslophook.a demo
+
+libslophook.a: $(SRC)
+	$(CC) $(CFLAGS) -c $(SRC)
+	$(CROSS)ar rcs $@ hook.o mem.o patch.o put.o arm64_relocate.o bridge_arm64.o
+
+demo: test/demo.c libslophook.a
+	$(CC) $(CFLAGS) -static -o $@ test/demo.c libslophook.a
+
+# Relocator unit tests run on the host - the logic is pure bit manipulation.
+check-reloc:
+	cc -O1 -Wall -o /tmp/test_reloc test/test_relocate.c src/arm64_relocate.c
+	/tmp/test_reloc | python3 test/verify.py
+
+run: demo
+	qemu-aarch64-static ./demo
+
+clean:
+	rm -f *.o libslophook.a demo
+
+.PHONY: all clean run check-reloc
