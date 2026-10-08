@@ -1,7 +1,7 @@
 # SlopHook
 SlopHook is an android arm64 lightweight inline hook implementation that may resembles Dobby. I didn't able to get to build the dobby hook library for my android arm64 use case so i just ask AI to make this for me. Warning this is slopped by Opus 5 high, from my testing it works quite well but just keep it in mind if some implementation are weird. This may be useful for you if you just want to get something working or testing fast, and no need to waste your token again to build new hooking things for the android arm64.
 
-Below is Opus 5 SlopHook instruction, end of human interaction here.
+Below is Opus 5 SlopHook instruction on how this works and how to import this into your project, end of human interaction here.
 
 # slophook — building your own inline hook engine for Android arm64
 
