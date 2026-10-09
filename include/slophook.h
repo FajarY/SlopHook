@@ -213,6 +213,101 @@ void *sh_resolve(const char *name_substring, size_t offset);
 /* dlopen + dlsym in one call, for exported symbols. NULL on failure. */
 void *sh_sym(const char *soname, const char *symbol);
 
+/* ======================================================================
+ * Backtracing
+ *
+ * Two strategies, the same split Frida offers:
+ *
+ *   SH_BT_FP      Walk the AAPCS64 frame-record chain through X29. Exact
+ *                 when frame pointers are maintained - which Android arm64
+ *                 code overwhelmingly does - and it simply runs out of
+ *                 frames when they are not. This is the "accurate" mode.
+ *                 It is NOT DWARF/.eh_frame based: a leaf that never sets
+ *                 up a frame record will not appear, and code built with
+ *                 -fomit-frame-pointer will stop the walk early.
+ *
+ *   SH_BT_FUZZY   Scan the stack for words that look like return
+ *                 addresses: 4-byte aligned, inside an executable
+ *                 mapping, and immediately preceded by a call instruction
+ *                 (BL, BLR, or any of the PAC BLRAA/BLRAB forms). Needs
+ *                 no unwind information at all, finds frames the FP walk
+ *                 misses, and will report the occasional stale address
+ *                 left on the stack by an earlier call.
+ *
+ *   SH_BT_AUTO    FP first; fall back to FUZZY if it yields fewer than
+ *                 two frames.
+ *
+ * sh_backtrace* allocate nothing - you supply the array - and take no
+ * locks once the module snapshot exists. Call sh_refresh_modules() during
+ * setup so the first capture inside a hook does not have to build it, and
+ * again after anything dlopen()s a new library.
+ * ====================================================================== */
+
+typedef enum {
+    SH_BT_FP    = 0,
+    SH_BT_FUZZY = 1,
+    SH_BT_AUTO  = 2,
+} sh_backtrace_mode;
+
+/*
+ * Capture up to `max` return addresses for the calling thread, innermost
+ * first. The caller of sh_backtrace() is frame 0; sh_backtrace itself is
+ * never included. Returns the number written.
+ */
+size_t sh_backtrace(void **out, size_t max, sh_backtrace_mode mode);
+
+/*
+ * The same, from a register context captured by sh_instrument(). Frame 0
+ * is ctx->pc (the hooked instruction), frame 1 the function that called
+ * it, and so on.
+ *
+ * Accurate for a hook at a function's entry, where the prologue has not
+ * run yet so X30 still holds the caller's return address and X29 still
+ * holds the caller's frame. Hooking mid-function may lose frame 1.
+ */
+size_t sh_backtrace_from(const sh_context *ctx, void **out, size_t max,
+                         sh_backtrace_mode mode);
+
+/* Rebuild the cached snapshot of executable mappings. Returns how many
+ * executable ranges are now known. Call after dlopen(). */
+size_t sh_refresh_modules(void);
+
+/* ---- symbolication --------------------------------------------------- */
+
+typedef struct {
+    const void *address;
+    char        module[128];     /* basename, or "" if unknown          */
+    const void *module_base;     /* load base: address - base is the
+                                    offset you paste into IDA           */
+    size_t      module_offset;
+    char        symbol[160];     /* nearest exported symbol, or ""      */
+    size_t      symbol_offset;
+} sh_frame_info;
+
+/* Describe one address. Returns 1 if anything was resolved, 0 otherwise.
+ *
+ * This calls dladdr(), which may take a loader lock and is not reentrant.
+ * Capture addresses inside a hook and symbolicate them afterwards; do not
+ * call this from a hook on a function the dynamic loader itself uses.
+ */
+int sh_addr_info(const void *addr, sh_frame_info *out);
+
+/*
+ * One line for one address, e.g.
+ *     libtarget.so!0x2db37c (rc4_init+0x1c)
+ * falling back to a bare 0x... when nothing resolves. Returns the length
+ * written, excluding the terminator.
+ */
+size_t sh_format_frame(const void *addr, char *buf, size_t cap);
+
+/*
+ * A whole capture as newline-separated text:
+ *     #00 0x7b1c2d3400 libtarget.so!0x2db37c (rc4_init+0x1c)
+ *     #01 0x7b1c2d8120 libtarget.so!0x2e0a40
+ * Returns the length written, excluding the terminator.
+ */
+size_t sh_format_backtrace(void *const *frames, size_t n, char *buf, size_t cap);
+
 /* Human readable form of an sh_status. */
 const char *sh_strerror(sh_status st);
 

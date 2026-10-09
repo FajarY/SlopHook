@@ -16,7 +16,8 @@
 #include "arm64_insn.h"
 #include "mem.h"
 #include <dlfcn.h>
-#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -247,29 +248,69 @@ sh_status sh_put_jump(void *addr, void *dest) {
 }
 
 /* ------------------------------------------------------ finding targets */
-void *sh_module_base(const char *name_substring, size_t *out_span) {
-    if (!name_substring) return NULL;
-    FILE *f = fopen("/proc/self/maps", "re");
-    if (!f) return NULL;
-
-    char line[1024];
-    uint64_t base = 0, last_end = 0;
-    int found = 0;
-    while (fgets(line, sizeof line, f)) {
-        /* "<start>-<end> perms offset dev inode   pathname" */
-        const char *path = strchr(line, '/');
-        if (!path) continue;           /* anonymous (e.g. .bss): not a break */
-        if (!strstr(path, name_substring)) {
-            if (found) break;          /* a different file: this module ended */
-            continue;
-        }
-        uint64_t s, e;
-        if (sscanf(line, "%llx-%llx", (unsigned long long *)&s,
-                                      (unsigned long long *)&e) != 2) continue;
-        if (!found) { base = s; found = 1; }
-        last_end = e;
+static uint64_t put_hex64(const char **pp) {
+    const char *p = *pp;
+    uint64_t v = 0;
+    for (;; p++) {
+        unsigned d;
+        if      (*p >= '0' && *p <= '9') d = (unsigned)(*p - '0');
+        else if (*p >= 'a' && *p <= 'f') d = (unsigned)(*p - 'a' + 10);
+        else if (*p >= 'A' && *p <= 'F') d = (unsigned)(*p - 'A' + 10);
+        else break;
+        v = (v << 4) | d;
     }
-    fclose(f);
+    *pp = p;
+    return v;
+}
+
+/* Allocation-free, like everything else that reads /proc/self/maps here, so
+ * it stays usable from inside a hook on the allocator. */
+void *sh_module_base(const char *name_substring, size_t *out_span) {
+    if (!name_substring || !*name_substring) return NULL;
+    const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+
+    const size_t nlen = strlen(name_substring);
+    char buf[8192];
+    size_t held = 0;
+    uint64_t base = 0, last_end = 0;
+    int found = 0, done = 0;
+
+    while (!done) {
+        const ssize_t got = read(fd, buf + held, sizeof buf - held);
+        if (got <= 0) break;
+        size_t avail = held + (size_t)got, from = 0;
+        for (size_t i = 0; i < avail && !done; i++) {
+            if (buf[i] != '\n') continue;
+            char        *line = buf + from;
+            const size_t len  = i - from;
+            from = i + 1;
+            line[len] = '\0';                   /* safe: this was the '\n' */
+
+            const char *path = memchr(line, '/', len);
+            if (!path) continue;        /* anonymous (e.g. .bss): not a break */
+
+            int match = 0;
+            for (const char *q = path; (size_t)(line + len - q) >= nlen; q++)
+                if (memcmp(q, name_substring, nlen) == 0) { match = 1; break; }
+            if (!match) {
+                if (found) done = 1;    /* a different file: this module ended */
+                continue;
+            }
+            const char *p = line;
+            const uint64_t s = put_hex64(&p);
+            if (*p != '-') continue;
+            p++;
+            const uint64_t e = put_hex64(&p);
+            if (e <= s) continue;
+            if (!found) { base = s; found = 1; }
+            last_end = e;
+        }
+        held = avail - from;
+        if (held >= sizeof buf) held = 0;
+        else memmove(buf, buf + from, held);
+    }
+    close(fd);
     if (!found) return NULL;
     if (out_span) *out_span = (size_t)(last_end - base);
     return (void *)(uintptr_t)base;

@@ -1,7 +1,6 @@
 #define _GNU_SOURCE
 #include "mem.h"
 #include <fcntl.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -45,27 +44,68 @@ static uint64_t page_up(uint64_t a) {
  * One pass over /proc/self/maps looking for the mapping that contains
  * `addr`. Returns its PROT_* bits and bounds.
  */
+static uint64_t hex64(const char **pp) {
+    const char *p = *pp;
+    uint64_t v = 0;
+    for (;; p++) {
+        unsigned d;
+        if      (*p >= '0' && *p <= '9') d = (unsigned)(*p - '0');
+        else if (*p >= 'a' && *p <= 'f') d = (unsigned)(*p - 'a' + 10);
+        else if (*p >= 'A' && *p <= 'F') d = (unsigned)(*p - 'A' + 10);
+        else break;
+        v = (v << 4) | d;
+    }
+    *pp = p;
+    return v;
+}
+
+/*
+ * Deliberately open/read rather than fopen/fgets: stdio allocates, and
+ * every patch and every hook install comes through here. A caller who has
+ * hooked malloc - a completely reasonable thing to do - would otherwise
+ * see their own hook fire in the middle of sh_hook() and sh_unhook().
+ * open, read and close allocate nothing.
+ */
 static int map_of(uint64_t addr, int *prot, uint64_t *start, uint64_t *end) {
     addr = SH_UNTAG(addr);
-    FILE *f = fopen("/proc/self/maps", "re");
-    if (!f) return 0;
+    const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
 
-    char line[512];
+    char buf[8192];
+    size_t held = 0;
     int found = 0;
-    while (fgets(line, sizeof line, f)) {
-        unsigned long long s, e;
-        char perm[8];
-        if (sscanf(line, "%llx-%llx %4s", &s, &e, perm) != 3) continue;
-        if (addr < (uint64_t)s || addr >= (uint64_t)e) continue;
-        if (prot)  *prot  = (perm[0] == 'r' ? PROT_READ  : 0)
-                          | (perm[1] == 'w' ? PROT_WRITE : 0)
-                          | (perm[2] == 'x' ? PROT_EXEC  : 0);
-        if (start) *start = (uint64_t)s;
-        if (end)   *end   = (uint64_t)e;
-        found = 1;
-        break;
+    while (!found) {
+        const ssize_t got = read(fd, buf + held, sizeof buf - held);
+        if (got <= 0) break;
+        size_t avail = held + (size_t)got, from = 0;
+        for (size_t i = 0; i < avail && !found; i++) {
+            if (buf[i] != '\n') continue;
+            const char  *line = buf + from;
+            const size_t len  = i - from;
+            from = i + 1;
+
+            const char *p = line;
+            const uint64_t s = hex64(&p);
+            if (*p != '-') continue;
+            p++;
+            const uint64_t e = hex64(&p);
+            if (e <= s || *p != ' ') continue;
+            p++;
+            if ((size_t)(p - line) + 4 > len) continue;   /* no perms field */
+            if (addr < s || addr >= e) continue;
+
+            if (prot)  *prot  = (p[0] == 'r' ? PROT_READ  : 0)
+                              | (p[1] == 'w' ? PROT_WRITE : 0)
+                              | (p[2] == 'x' ? PROT_EXEC  : 0);
+            if (start) *start = s;
+            if (end)   *end   = e;
+            found = 1;
+        }
+        held = avail - from;
+        if (held >= sizeof buf) held = 0;
+        else memmove(buf, buf + from, held);
     }
-    fclose(f);
+    close(fd);
     return found;
 }
 
@@ -82,9 +122,9 @@ int sh_mem_patchable(uint64_t addr, size_t len) {
     if (!map_of(addr, &prot, &start, &end)) {
         /* Distinguish "no maps file" from "address is not mapped": if we can
          * read maps at all, an address we did not find really is unmapped. */
-        FILE *f = fopen("/proc/self/maps", "re");
-        if (!f) return -1;
-        fclose(f);
+        const int probe = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+        if (probe < 0) return -1;
+        close(probe);
         return 0;
     }
     if (!(prot & PROT_EXEC))  return 0;   /* not code */
@@ -107,17 +147,35 @@ static arena *g_arenas;
 /* --------------------------------------------------- /proc/self/maps scan */
 typedef struct { uint64_t start, end; } range;
 
+/* Also allocation-free: this runs on every hook install. */
 static size_t read_maps(range *out, size_t cap) {
-    FILE *f = fopen("/proc/self/maps", "re");
-    if (!f) return 0;
-    char line[512];
-    size_t n = 0;
-    while (n < cap && fgets(line, sizeof line, f)) {
-        uint64_t s, e;
-        if (sscanf(line, "%lx-%lx", (unsigned long *)&s, (unsigned long *)&e) == 2)
-            out[n].start = s, out[n].end = e, n++;
+    const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+
+    char buf[8192];
+    size_t held = 0, n = 0;
+    while (n < cap) {
+        const ssize_t got = read(fd, buf + held, sizeof buf - held);
+        if (got <= 0) break;
+        size_t avail = held + (size_t)got, from = 0;
+        for (size_t i = 0; i < avail && n < cap; i++) {
+            if (buf[i] != '\n') continue;
+            const char *p = buf + from;
+            from = i + 1;
+            const uint64_t s = hex64(&p);
+            if (*p != '-') continue;
+            p++;
+            const uint64_t e = hex64(&p);
+            if (e <= s) continue;
+            out[n].start = s;
+            out[n].end   = e;
+            n++;
+        }
+        held = avail - from;
+        if (held >= sizeof buf) held = 0;
+        else memmove(buf, buf + from, held);
     }
-    fclose(f);
+    close(fd);
     return n;
 }
 

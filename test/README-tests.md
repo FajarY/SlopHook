@@ -27,7 +27,12 @@ qemu-aarch64-static ./stress && qemu-aarch64-static ./reloc_exec
 qemu-aarch64-static ./puttest
 aarch64-linux-gnu-gcc -O2 -static -o guards test/guards.c shapes.o libslophook.a
 aarch64-linux-gnu-gcc -O2 -static -o arena  test/arena.c  libslophook.a
+aarch64-linux-gnu-gcc -O2 -static -pthread -o bttest test/bttest.c bt_nofp.o libslophook.a
+aarch64-linux-gnu-gcc -O2 -fPIC -fomit-frame-pointer -c test/bt_nofp.c -o bt_nofp.o
+aarch64-linux-gnu-gcc -O2 -o btdyn test/btdyn.c libslophook.a   # dynamic, for dladdr
 qemu-aarch64-static ./guards
+qemu-aarch64-static ./bttest
+qemu-aarch64-static -L /usr/aarch64-linux-gnu ./btdyn
 qemu-aarch64-static ./arena && SH_TEST_NO_RWX=1 qemu-aarch64-static ./arena
 qemu-aarch64-static ./conc2 8 300 1
 ./fuzz | python3 test/fuzz_verify.py

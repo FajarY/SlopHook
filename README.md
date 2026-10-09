@@ -1,5 +1,9 @@
 # SlopHook
-SlopHook is an android arm64 lightweight inline hook implementation that may resembles Dobby. I didn't able to get to build the dobby hook library for my android arm64 use case so i just ask AI to make this for me. Warning this is slopped by Opus 5 high, from my testing it works quite well but just keep it in mind if some implementation are weird. This may be useful for you if you just want to get something working or testing fast, and no need to waste your token again to build new hooking things for the android arm64.
+SlopHook is an android arm64 lightweight inline hook implementation that may resembles Dobby. I didn't able to get to build the dobby hook library for my android arm64 use case so i just ask AI to make this for me. Warning this is slopped by Opus 5 high, from my testing it works quite well but just keep it in mind if some implementation are weird. This may be useful for you if you just want to get something working or testing fast, and no need to waste your token again to build new hooking things for the android arm64. The useful feature in this project is:
+- Inline hooking with `sh_hook`
+- Frida style onEnter intercepting with `sh_instrument`
+- Patching the code directly with `sh_patch_code` or for convenience a one line patching with `sh_put_nop`, `sh_put_ret`, etc
+- Backtracing fuzzy style with `sh_backtrace`
 
 Below is Opus 5 SlopHook instruction on how this works and how to import this into your project, end of human interaction here.
 
@@ -445,7 +449,117 @@ void neuter_checks(void) {
 
 ---
 
-## 9. Building for Android
+## 9. Backtracing
+
+Two strategies, the same split Frida offers, over one shared validator.
+
+```c
+void  *frames[32];
+size_t n = sh_backtrace(frames, 32, SH_BT_AUTO);
+```
+
+From inside an instrument callback, where it is actually useful:
+
+```c
+static void who_called_me(sh_context *ctx, void *user) {
+    void  *frames[16];
+    size_t n = sh_backtrace_from(ctx, frames, 16, SH_BT_AUTO);
+    /* capture here, symbolicate later - see the reentrancy note below */
+    memcpy(saved, frames, n * sizeof *frames);
+    saved_n = n;
+}
+```
+
+| mode | how |
+|---|---|
+| `SH_BT_FP` | Walk the AAPCS64 frame-record chain through X29: `[X29]` is the caller's frame pointer, `[X29+8]` the return address into it. Exact where frame pointers are maintained, which Android arm64 code overwhelmingly does. |
+| `SH_BT_FUZZY` | Scan the stack for words that look like return addresses. Needs no unwind information at all. |
+| `SH_BT_AUTO` | FP first, falling back to FUZZY if the chain yields fewer than two frames. |
+
+### What makes the fuzzy scan usable
+
+A naive stack scan returns mostly noise. The filter is three tests, and the
+third does nearly all the work: a candidate must be 4-byte aligned, land
+inside a readable executable mapping, and **the four bytes immediately before
+it must decode as a call** — `BL`, `BLR`, or any of the PAC `BLRAA`/`BLRAAZ`/
+`BLRAB`/`BLRABZ` forms. Arbitrary stack garbage almost never has a call
+sitting in front of it.
+
+`BR` and `RET` deliberately do not count: a tail call leaves no return
+address, so a word in front of one is not a frame.
+
+The same filter validates every frame the FP walk produces, so a corrupted
+chain stops the walk instead of emitting nonsense. The FP walk additionally
+requires each frame pointer to be 16-byte aligned, inside the thread's stack,
+and strictly higher than the last — stacks grow down, so a chain that does not
+climb is a loop or an attack, and either way it ends the walk.
+
+### Honest limits
+
+`SH_BT_FP` is **not** DWARF/`.eh_frame` based. A leaf function that never sets
+up a frame record will not appear in the trace, and a module built with
+`-fomit-frame-pointer` stops the walk at its boundary. That is the whole
+reason `SH_BT_FUZZY` exists, and why `SH_BT_AUTO` is the sensible default. If
+you need true unwind-table accuracy through frame-pointer-less code, that
+means parsing `.eh_frame` (or using AOSP's `libunwindstack`), which this
+engine does not do.
+
+`SH_BT_FUZZY` over-reports. It finds stale return addresses left on the stack
+by earlier calls, and it will not find a frame whose return address is not
+preceded by a call — a signal trampoline, say. Frames come out innermost
+first, so the live chain appears at the top and the stale material after it.
+Treat them as candidates.
+
+### Symbolication
+
+```c
+char line[256];
+sh_format_frame(frames[0], line, sizeof line);
+/* -> "libtarget.so!0x2db37c (rc4_init+0x1c)"  */
+```
+
+| | |
+|---|---|
+| `sh_addr_info(addr, &info)` | module basename, load base, offset in module, and nearest exported symbol |
+| `sh_format_frame(addr, buf, cap)` | one line, falling back to a bare `0x...` |
+| `sh_format_backtrace(frames, n, buf, cap)` | the whole capture, newline separated |
+| `sh_refresh_modules()` | rebuild the cached snapshot of executable mappings |
+
+`module_offset` is `address - load base`, which is the number you paste into
+IDA. Non-exported functions resolve to module and offset only; `dladdr()`
+cannot name them and `.symtab` is usually stripped anyway.
+
+### Reentrancy
+
+Capturing is **allocation-free and lock-free** — you supply the array, and the
+module snapshot plus the thread's stack bounds are read with `open`/`read`
+rather than stdio. That is deliberate: it makes `sh_backtrace_from()` safe
+from a hook on `malloc` itself, which is exactly where you want a backtrace
+and exactly where anything that allocates would recurse forever. There is also
+a per-thread guard, so a hook that fires during a capture returns no frames
+rather than hanging.
+
+`sh_addr_info()` and the two formatters call `dladdr()`, which takes a loader
+lock. **Capture inside the hook, symbolicate after.** Call
+`sh_refresh_modules()` during setup so the first capture does not have to
+build the snapshot, and again after anything `dlopen()`s a library.
+
+For the record, hooking `malloc` and backtracing out of it is part of the test
+suite:
+
+```
+#00 0x4000009162b0 libc.so.6!0x962b0 (malloc+0x0)
+#01 0x7f39ad2d12b0 btdyn!0x12b0
+#02 0x7f39ad2d12cc btdyn!0x12cc
+#03 0x7f39ad2d12e0 btdyn!0x12e0
+#04 0x7f39ad2d1110 btdyn!0x1110
+#05 0x4000008a84c4 libc.so.6!0x284c4
+#06 0x4000008a8598 libc.so.6!0x28598 (__libc_start_main+0x98)
+```
+
+---
+
+## 10. Building for Android
 
 The build is `Android.mk` (ndk-build). Drop the tree into your project and add
 one line at the **end** of your own `jni/Android.mk`:
@@ -496,7 +610,7 @@ void install(void) {
 
 ---
 
-## 10. Known limitations
+## 11. Known limitations
 
 - **No thread suspension.** See the CMODX discussion in §2. Installing and
   removing a 4-byte detour is a single atomic store, but a 16-byte detour is
@@ -510,6 +624,7 @@ void install(void) {
 - **Targets must be in a readable, executable mapping.** Anything else is
   refused with `SH_ERR_NOTCODE`. An execute-only (`--x`) mapping is refused
   too, because the original bytes cannot be read out to save them.
+- **Backtracing is frame-pointer or heuristic, never DWARF.** See §9.
 - **No function-length knowledge.** A 16-byte detour, or a long
   `sh_put_long`, will happily overwrite whatever follows a short
   function. Overlapping hooks and patches are refused, but a *neighbour that is
@@ -528,8 +643,6 @@ void install(void) {
   (literal)` scales its immediate by 4, so a 64-bit literal can land at a
   4-mod-8 address. Linux and Android run with `SCTLR_EL1.A = 0`, where this is
   permitted; it is not architecturally guaranteed.
-
----
 
 # Importing slophook into your Android project
 
@@ -698,7 +811,21 @@ static void install(void) {
              sh_strerror(st), sh_size_int(0));
     }
 
-    /* 3. and undo everything */
+    /* 3. find out who calls something */
+    static void *bt[16];
+    static size_t bt_n;
+    void log_caller(sh_context *ctx, void *u) {
+        (void)u;
+        bt_n = sh_backtrace_from(ctx, bt, 16, SH_BT_AUTO);   /* capture only */
+    }
+    sh_refresh_modules();                   /* build the snapshot up front */
+    sh_instrument(sh_sym("libc.so", "open"), log_caller, NULL);
+    /* ... later, off the hook path, where dladdr is safe: */
+    char text[2048];
+    sh_format_backtrace(bt, bt_n, text, sizeof text);
+    LOGI("%s", text);
+
+    /* 4. and undo everything */
     LOGI("reverted %zu patches, removed %zu hooks",
          sh_revert_all(), sh_unhook_all());
 }
@@ -749,6 +876,9 @@ README.
 | `sh_hook` returns `could not make target page writable` | SELinux denied `execmod` *and* `/proc/self/mem` was unavailable; check the process is not running under a restrictive domain |
 | `sh_hook` returns `target out of branch range` | no page free within ±128MB of the target and the prologue needs a tail jump back. Refused on purpose; see README §10 |
 | `sh_hook` / `sh_put_*` returns `already hooked` for a fresh address | its region overlaps an existing hook or patch — likely a very short neighbouring function |
+| `sh_backtrace` returns 0 or 1 frame | the thread's stack bounds could not be read, or the frame chain ends immediately. Try `SH_BT_FUZZY`; if the target is built `-fomit-frame-pointer` that is expected |
+| backtrace frames in a newly `dlopen`ed library do not resolve | the cached snapshot predates it. Call `sh_refresh_modules()` |
+| a hook on `malloc` hangs the process | you are on a tree from before the stdio removal. See README §12 |
 | `sh_put_hex` returns `invalid argument` | the string did not parse, or did not come to a non-zero multiple of 4 bytes. Check with `sh_size_hex()` |
 | `sh_put_b` / `sh_put_bl` returns `target out of branch range` | more than ±128MB away; use `sh_put_jump` (16 bytes, clobbers X17) or a hook |
 | `sh_hook` returns `prologue branches into the patched region` | the first instruction branches into the bytes being replaced; this target cannot be hooked at its entry |

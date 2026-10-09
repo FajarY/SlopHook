@@ -27,6 +27,7 @@ SLOPHOOK_SRC := \
     src/mem.c \
     src/patch.c \
     src/put.c \
+    src/backtrace.c \
     src/arm64_relocate.c \
     src/bridge_arm64.S
 
