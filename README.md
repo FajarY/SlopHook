@@ -7,7 +7,7 @@ SlopHook is an android arm64 lightweight inline hook implementation that may res
 
 Below is Opus 5 SlopHook instruction on how this works and how to import this into your project, end of human interaction here.
 
-# slophook — building your own inline hook engine for Android arm64
+# SlopHook — building your own inline hook engine for Android arm64
 
 A working, minimal inline hooking engine (~700 lines) built the same way Dobby
 is: near-memory trampolines, a real instruction relocator, and a single-word
@@ -644,7 +644,7 @@ void install(void) {
   4-mod-8 address. Linux and Android run with `SCTLR_EL1.A = 0`, where this is
   permitted; it is not architecturally guaranteed.
 
-# Importing slophook into your Android project
+# Importing SlopHook into your Android project
 
 arm64-v8a only. Needs NDK r19 or newer (anything with a unified clang toolchain).
 
